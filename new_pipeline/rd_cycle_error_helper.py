@@ -344,6 +344,35 @@ def write_summary_with_mask_labels_csv(
             writer.writerow({"mask_name": all_masks_label, "metric": "mm", **global_mm_stats})
 
 
+def write_patient_timing_csv(rows, out_path):
+    fieldnames = [
+        "subject_id",
+        "status",
+        "error_message",
+        "total_seconds",
+        "image_load_seconds",
+        "forward_registration_dvf_seconds",
+        "backward_registration_dvf_seconds",
+        "point_processing_seconds",
+    ]
+    with open(out_path, "w", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "subject_id": str(row.get("subject_id", "")),
+                    "status": str(row.get("status", "")),
+                    "error_message": str(row.get("error_message", "")),
+                    "total_seconds": row.get("total_seconds", ""),
+                    "image_load_seconds": row.get("image_load_seconds", ""),
+                    "forward_registration_dvf_seconds": row.get("forward_registration_dvf_seconds", ""),
+                    "backward_registration_dvf_seconds": row.get("backward_registration_dvf_seconds", ""),
+                    "point_processing_seconds": row.get("point_processing_seconds", ""),
+                }
+            )
+
+
 # Prepare a 2D axial slice from a 3D image for visualization, applying windowing if needed
 def prepare_axial_slice(img3d, z_idx, is_mri=False):
     img3d = np.asarray(img3d, dtype=np.float32)

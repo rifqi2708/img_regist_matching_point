@@ -34,6 +34,7 @@ try:
         validate_origin_mask,
         validate_sampled_points_inside_mask,
         visualize_cycle_result,
+        write_patient_timing_csv,
         write_points_csv_with_mask,
         write_summary_with_mask_labels_csv,
     )
@@ -46,6 +47,7 @@ except ImportError:
         validate_origin_mask,
         validate_sampled_points_inside_mask,
         visualize_cycle_result,
+        write_patient_timing_csv,
         write_points_csv_with_mask,
         write_summary_with_mask_labels_csv,
     )
@@ -102,6 +104,15 @@ REGISTRATION_PARAMETER_OVERRIDES = {
 
 class PointMappingError(RuntimeError):
     """Raised when a point cannot be mapped safely through DVF."""
+
+
+class SubjectProcessingError(RuntimeError):
+    """Raised when subject processing fails after timing has started."""
+
+    def __init__(self, subject_id: str, message: str, timing_info: dict[str, float | None]):
+        super().__init__(message)
+        self.subject_id = subject_id
+        self.timing_info = dict(timing_info)
 
 
 def is_nifti_file(name):
@@ -527,6 +538,41 @@ def _save_cycle_visualization(
     )
 
 
+def _make_empty_timing_info() -> dict[str, float | None]:
+    return {
+        "image_load_seconds": None,
+        "forward_registration_dvf_seconds": None,
+        "backward_registration_dvf_seconds": None,
+        "point_processing_seconds": None,
+        "total_seconds": None,
+    }
+
+
+def _make_timing_row(
+    subject_id: str,
+    status: str,
+    error_message: str = "",
+    total_seconds: float | None = None,
+    timing_info: dict[str, float | None] | None = None,
+) -> dict[str, str | float | None]:
+    row = {
+        "subject_id": subject_id,
+        "status": status,
+        "error_message": error_message,
+        "total_seconds": total_seconds,
+        "image_load_seconds": None,
+        "forward_registration_dvf_seconds": None,
+        "backward_registration_dvf_seconds": None,
+        "point_processing_seconds": None,
+    }
+    if timing_info is not None:
+        row["image_load_seconds"] = timing_info.get("image_load_seconds")
+        row["forward_registration_dvf_seconds"] = timing_info.get("forward_registration_dvf_seconds")
+        row["backward_registration_dvf_seconds"] = timing_info.get("backward_registration_dvf_seconds")
+        row["point_processing_seconds"] = timing_info.get("point_processing_seconds")
+    return row
+
+
 def run_cycle_pair(
     subject_id,
     im1_file,
@@ -544,163 +590,187 @@ def run_cycle_pair(
     viz_dir=OUTPUT_DIR,
     viz_layout=VIZ_LAYOUT,
 ):
-    if point_mode not in ("csv", "random", "fixed"):
-        raise ValueError("point_mode must be one of 'csv', 'random', or 'fixed'")
-    if point_mode == "random" and num_points_per_mask < 1:
-        raise ValueError("num_points_per_mask must be >= 1 when point_mode='random'")
-    _validate_viz_layout(viz_layout)
+    timing_info = _make_empty_timing_info()
+    time_start = time.perf_counter()
 
-    for im_path in (im1_file, im2_file):
-        if not os.path.exists(im_path):
-            raise FileNotFoundError(f"Image file not found: {im_path}")
+    try:
+        if point_mode not in ("csv", "random", "fixed"):
+            raise ValueError("point_mode must be one of 'csv', 'random', or 'fixed'")
+        if point_mode == "random" and num_points_per_mask < 1:
+            raise ValueError("num_points_per_mask must be >= 1 when point_mode='random'")
+        _validate_viz_layout(viz_layout)
 
-    if point_mode == "csv":
-        if query_points_by_mask is None:
-            raise ValueError("query_points_by_mask must be provided when point_mode='csv'")
-        mask_items = _resolve_csv_mask_items(subject_id, mask1_dir, query_points_by_mask)
-    elif point_mode == "random":
-        mask_map_1 = list_mask_files(mask1_dir)
-        mask_items = sorted(mask_map_1.items())
-    else:
-        if fixed_point is None:
-            raise ValueError("fixed_point must be provided when point_mode='fixed'")
-        mask_items = [("fixed_point", None)]
+        for im_path in (im1_file, im2_file):
+            if not os.path.exists(im_path):
+                raise FileNotFoundError(f"Image file not found: {im_path}")
 
-    if point_mode == "csv" and not mask_items:
-        raise RuntimeError(f"No CSV query points were available for subject '{subject_id}'.")
-
-    if visualize and viz_save:
-        os.makedirs(viz_dir, exist_ok=True)
-
-    time_start = time.time()
-    ctx1 = load_image_context(im1_file, is_mri=is_mri)
-    ctx2 = load_image_context(im2_file, is_mri=is_mri)
-    time_after_load = time.time()
-    print(f"[{subject_id}] image context loading time: {time_after_load - time_start:.3f}s")
-
-    forward_dvf = run_registration_and_compute_dvf(ctx1["itk_image"], ctx2["itk_image"])
-    time_after_forward = time.time()
-    print(f"[{subject_id}] forward registration+DVF time: {time_after_forward - time_after_load:.3f}s")
-
-    backward_dvf = run_registration_and_compute_dvf(ctx2["itk_image"], ctx1["itk_image"])
-    time_after_backward = time.time()
-    print(f"[{subject_id}] backward registration+DVF time: {time_after_backward - time_after_forward:.3f}s")
-
-    all_results = []
-    per_mask_results = {}
-
-    for mask_idx, mask_item in enumerate(mask_items):
         if point_mode == "csv":
-            mask_file_name, mask1_path, csv_points = mask_item
-        else:
-            mask_file_name, mask1_path = mask_item
-            csv_points = None
-        mask_label = f"{subject_id}/{mask_file_name}"
-        print(f"[{subject_id}] Processing mask: {mask_file_name}")
-
-        if point_mode == "fixed":
-            candidate_points = np.asarray([validate_fixed_point(fixed_point, ctx1["img"])], dtype=np.int64)
-            max_attempts = 1
+            if query_points_by_mask is None:
+                raise ValueError("query_points_by_mask must be provided when point_mode='csv'")
+            mask_items = _resolve_csv_mask_items(subject_id, mask1_dir, query_points_by_mask)
         elif point_mode == "random":
-            mask1_array = load_mask_array(
-                im1_file,
-                mask1_path,
-                is_mri=is_mri,
-                ref_image=ctx1["img"]["img"],
-                mask_name=f"{subject_id}:{mask_file_name}",
-            )
-            candidate_points = sample_random_mask_points(mask1_array, int(num_points_per_mask), int(seed) + int(mask_idx))
-            validate_sampled_points_inside_mask(candidate_points, mask1_array, f"{subject_id}:{mask_file_name}")
-            max_attempts = len(candidate_points)
+            mask_map_1 = list_mask_files(mask1_dir)
+            mask_items = sorted(mask_map_1.items())
         else:
-            mask1_array = load_mask_array(
-                im1_file,
-                mask1_path,
-                is_mri=is_mri,
-                ref_image=ctx1["img"]["img"],
-                mask_name=f"{subject_id}:{mask_file_name}",
-            )
-            candidate_points = _validate_csv_points_for_mask(
-                subject_id=subject_id,
-                mask_file_name=mask_file_name,
-                points_xyz=csv_points,
-                img_ctx=ctx1,
-                mask1_array=mask1_array,
-            )
-            max_attempts = len(candidate_points)
+            if fixed_point is None:
+                raise ValueError("fixed_point must be provided when point_mode='fixed'")
+            mask_items = [("fixed_point", None)]
 
-        required_points = 1 if point_mode == "fixed" else (
-            len(candidate_points) if point_mode == "csv" else int(num_points_per_mask)
-        )
-        mask_results = []
-        attempts = 0
-        last_error = None
+        if point_mode == "csv" and not mask_items:
+            raise RuntimeError(f"No CSV query points were available for subject '{subject_id}'.")
 
-        for point in candidate_points:
-            if attempts >= max_attempts:
-                break
-            attempts += 1
-            try:
-                result = compute_cycle_for_point(
-                    point_1=point,
-                    ctx_12=ctx1,
-                    ctx_21=ctx2,
-                    forward_dvf=forward_dvf,
-                    backward_dvf=backward_dvf,
-                )
-            except PointMappingError as exc:
-                last_error = exc
-                if point_mode in ("csv", "fixed"):
-                    raise RuntimeError(
-                        f"Cycle mapping failed for {mask_label} at query point {np.asarray(point, dtype=int).tolist()}: {exc}"
-                    ) from exc
-                continue
+        if visualize and viz_save:
+            os.makedirs(viz_dir, exist_ok=True)
 
-            result["mask_name"] = mask_label
-            result["subject_id"] = subject_id
-            result["coord_space"] = COORD_SPACE_RAW_ITK
-            mask_results.append(result)
-            all_results.append(result)
+        ctx1 = load_image_context(im1_file, is_mri=is_mri)
+        ctx2 = load_image_context(im2_file, is_mri=is_mri)
+        time_after_load = time.perf_counter()
+        timing_info["image_load_seconds"] = time_after_load - time_start
+        print(f"[{subject_id}] image context loading time: {timing_info['image_load_seconds']:.3f}s")
 
-            _save_cycle_visualization(
-                subject_id=subject_id,
-                mask_file_name=mask_file_name,
-                mask_results=mask_results,
-                result=result,
-                query_img=ctx1["img"]["img"],
-                target_img=ctx2["img"]["img"],
-                visualize=visualize,
-                viz_save=viz_save,
-                viz_show=viz_show,
-                viz_dir=viz_dir,
-                is_mri=is_mri,
-                viz_layout=viz_layout,
-            )
+        forward_dvf = run_registration_and_compute_dvf(ctx1["itk_image"], ctx2["itk_image"])
+        time_after_forward = time.perf_counter()
+        timing_info["forward_registration_dvf_seconds"] = time_after_forward - time_after_load
+        print(f"[{subject_id}] forward registration+DVF time: {timing_info['forward_registration_dvf_seconds']:.3f}s")
+
+        backward_dvf = run_registration_and_compute_dvf(ctx2["itk_image"], ctx1["itk_image"])
+        time_after_backward = time.perf_counter()
+        timing_info["backward_registration_dvf_seconds"] = time_after_backward - time_after_forward
+        print(f"[{subject_id}] backward registration+DVF time: {timing_info['backward_registration_dvf_seconds']:.3f}s")
+
+        all_results = []
+        per_mask_results = {}
+
+        for mask_idx, mask_item in enumerate(mask_items):
+            if point_mode == "csv":
+                mask_file_name, mask1_path, csv_points = mask_item
+            else:
+                mask_file_name, mask1_path = mask_item
+                csv_points = None
+            mask_label = f"{subject_id}/{mask_file_name}"
+            print(f"[{subject_id}] Processing mask: {mask_file_name}")
 
             if point_mode == "fixed":
-                break
+                candidate_points = np.asarray([validate_fixed_point(fixed_point, ctx1["img"])], dtype=np.int64)
+                max_attempts = 1
+            elif point_mode == "random":
+                mask1_array = load_mask_array(
+                    im1_file,
+                    mask1_path,
+                    is_mri=is_mri,
+                    ref_image=ctx1["img"]["img"],
+                    mask_name=f"{subject_id}:{mask_file_name}",
+                )
+                candidate_points = sample_random_mask_points(
+                    mask1_array, int(num_points_per_mask), int(seed) + int(mask_idx)
+                )
+                validate_sampled_points_inside_mask(candidate_points, mask1_array, f"{subject_id}:{mask_file_name}")
+                max_attempts = len(candidate_points)
+            else:
+                mask1_array = load_mask_array(
+                    im1_file,
+                    mask1_path,
+                    is_mri=is_mri,
+                    ref_image=ctx1["img"]["img"],
+                    mask_name=f"{subject_id}:{mask_file_name}",
+                )
+                candidate_points = _validate_csv_points_for_mask(
+                    subject_id=subject_id,
+                    mask_file_name=mask_file_name,
+                    points_xyz=csv_points,
+                    img_ctx=ctx1,
+                    mask1_array=mask1_array,
+                )
+                max_attempts = len(candidate_points)
 
-        if len(mask_results) < required_points:
-            details = (
-                f"Only collected {len(mask_results)}/{required_points} valid mapped points "
-                f"after {attempts} attempts for mask {mask_label}."
+            required_points = 1 if point_mode == "fixed" else (
+                len(candidate_points) if point_mode == "csv" else int(num_points_per_mask)
             )
-            if last_error is not None:
-                details += f" Last mapping error: {last_error}"
-            raise RuntimeError(details)
+            mask_results = []
+            attempts = 0
+            last_error = None
 
-        per_mask_results[mask_label] = mask_results
+            for point in candidate_points:
+                if attempts >= max_attempts:
+                    break
+                attempts += 1
+                try:
+                    result = compute_cycle_for_point(
+                        point_1=point,
+                        ctx_12=ctx1,
+                        ctx_21=ctx2,
+                        forward_dvf=forward_dvf,
+                        backward_dvf=backward_dvf,
+                    )
+                except PointMappingError as exc:
+                    last_error = exc
+                    if point_mode in ("csv", "fixed"):
+                        raise RuntimeError(
+                            f"Cycle mapping failed for {mask_label} at query point {np.asarray(point, dtype=int).tolist()}: {exc}"
+                        ) from exc
+                    continue
 
-    del forward_dvf
-    del backward_dvf
-    del ctx1
-    del ctx2
-    gc.collect()
+                result["mask_name"] = mask_label
+                result["subject_id"] = subject_id
+                result["coord_space"] = COORD_SPACE_RAW_ITK
+                mask_results.append(result)
+                all_results.append(result)
 
-    if not all_results:
-        raise RuntimeError(f"No cycle results were produced for subject '{subject_id}'.")
+                _save_cycle_visualization(
+                    subject_id=subject_id,
+                    mask_file_name=mask_file_name,
+                    mask_results=mask_results,
+                    result=result,
+                    query_img=ctx1["img"]["img"],
+                    target_img=ctx2["img"]["img"],
+                    visualize=visualize,
+                    viz_save=viz_save,
+                    viz_show=viz_show,
+                    viz_dir=viz_dir,
+                    is_mri=is_mri,
+                    viz_layout=viz_layout,
+                )
 
-    return all_results, per_mask_results
+                if point_mode == "fixed":
+                    break
+
+            if len(mask_results) < required_points:
+                details = (
+                    f"Only collected {len(mask_results)}/{required_points} valid mapped points "
+                    f"after {attempts} attempts for mask {mask_label}."
+                )
+                if last_error is not None:
+                    details += f" Last mapping error: {last_error}"
+                raise RuntimeError(details)
+
+            per_mask_results[mask_label] = mask_results
+
+        time_after_points = time.perf_counter()
+        timing_info["point_processing_seconds"] = time_after_points - time_after_backward
+        timing_info["total_seconds"] = time_after_points - time_start
+        print(f"[{subject_id}] point processing time: {timing_info['point_processing_seconds']:.3f}s")
+        print(f"[{subject_id}] total processing time: {timing_info['total_seconds']:.3f}s")
+
+        del forward_dvf
+        del backward_dvf
+        del ctx1
+        del ctx2
+        gc.collect()
+
+        if not all_results:
+            raise RuntimeError(f"No cycle results were produced for subject '{subject_id}'.")
+
+        return all_results, per_mask_results, timing_info
+    except Exception as exc:
+        if timing_info["backward_registration_dvf_seconds"] is not None and timing_info["point_processing_seconds"] is None:
+            timing_info["point_processing_seconds"] = time.perf_counter() - (
+                time_start
+                + timing_info["image_load_seconds"]
+                + timing_info["forward_registration_dvf_seconds"]
+                + timing_info["backward_registration_dvf_seconds"]
+            )
+        timing_info["total_seconds"] = time.perf_counter() - time_start
+        raise SubjectProcessingError(subject_id, str(exc), timing_info) from exc
 
 
 def run_dataset_cycle(
@@ -747,12 +817,14 @@ def run_dataset_cycle(
     per_mask_aggregate = {}
     failed_subjects = []
     processed_subjects = 0
+    patient_timing_rows = []
 
     for subject_idx, subject_id in enumerate(subject_ids, start=1):
         print(f"\n[{subject_idx:03d}/{len(subject_ids):03d}] Subject: {subject_id}")
+        subject_start = time.perf_counter()
         try:
             pair = resolve_subject_pair(subject_id, images_root, masks_root)
-            pair_results, pair_per_mask = run_cycle_pair(
+            pair_results, pair_per_mask, pair_timing = run_cycle_pair(
                 subject_id=pair["subject_id"],
                 im1_file=pair["im1_file"],
                 im2_file=pair["im2_file"],
@@ -773,8 +845,36 @@ def run_dataset_cycle(
             for mask_name, mask_results in pair_per_mask.items():
                 per_mask_aggregate.setdefault(mask_name, []).extend(mask_results)
             processed_subjects += 1
+            patient_timing_rows.append(
+                _make_timing_row(
+                    subject_id=subject_id,
+                    status="success",
+                    total_seconds=time.perf_counter() - subject_start,
+                    timing_info=pair_timing,
+                )
+            )
+        except SubjectProcessingError as exc:
+            failed_subjects.append((subject_id, str(exc)))
+            patient_timing_rows.append(
+                _make_timing_row(
+                    subject_id=subject_id,
+                    status="failed",
+                    error_message=str(exc),
+                    total_seconds=time.perf_counter() - subject_start,
+                    timing_info=exc.timing_info,
+                )
+            )
+            print(f"WARNING: skipping subject '{subject_id}' due to error: {exc}")
         except Exception as exc:
             failed_subjects.append((subject_id, str(exc)))
+            patient_timing_rows.append(
+                _make_timing_row(
+                    subject_id=subject_id,
+                    status="failed",
+                    error_message=str(exc),
+                    total_seconds=time.perf_counter() - subject_start,
+                )
+            )
             print(f"WARNING: skipping subject '{subject_id}' due to error: {exc}")
             continue
 
@@ -795,6 +895,7 @@ def run_dataset_cycle(
         run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         summary_csv_path = os.path.join(output_dir, f"cycle_summary_{run_stamp}.csv")
         points_csv_path = os.path.join(output_dir, f"cycle_points_{run_stamp}.csv")
+        patient_timing_csv_path = os.path.join(output_dir, f"cycle_patient_timing_{run_stamp}.csv")
         write_summary_with_mask_labels_csv(
             per_mask_rows,
             summary_csv_path,
@@ -803,8 +904,10 @@ def run_dataset_cycle(
             all_masks_label="ALL_MASKS",
         )
         write_points_csv_with_mask(all_results, points_csv_path)
+        write_patient_timing_csv(patient_timing_rows, patient_timing_csv_path)
         print(f"summary csv saved: {summary_csv_path}")
         print(f"points csv saved: {points_csv_path}")
+        print(f"patient timing csv saved: {patient_timing_csv_path}")
 
     print("\nRun complete")
     print(f"Processed subjects: {processed_subjects}")
