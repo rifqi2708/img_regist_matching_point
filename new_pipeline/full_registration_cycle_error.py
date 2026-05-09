@@ -71,7 +71,7 @@ SEED = 1
 IS_MRI = False
 VISUALIZE = False
 VIZ_SHOW = False
-VIZ_SAVE = True
+VIZ_SAVE = False
 EXPORT_CSV = True
 VIZ_LAYOUT = (2, 2)
 
@@ -360,7 +360,7 @@ def build_parameter_object() -> itk.ParameterObject:
     return parameter_object
 
 
-def run_registration_and_compute_dvf(fixed_image: itk.Image, moving_image: itk.Image) -> itk.Image:
+def run_registration_and_compute_dvf(fixed_image: itk.Image, moving_image: itk.Image) -> np.ndarray:
     parameter_object = build_parameter_object()
     _, transform_parameter_object = itk.elastix_registration_method(
         fixed_image,
@@ -377,16 +377,12 @@ def run_registration_and_compute_dvf(fixed_image: itk.Image, moving_image: itk.I
         transformix_filter.SetOutputDirectory(temp_dir)
         transformix_filter.Update()
         dvf_image = transformix_filter.GetOutputDeformationField()
-        # Materialize a standalone copy before the filter/temp directory go out of scope.
-        # Some ITK outputs can retain references to the producing pipeline, which may
-        # otherwise lead to native crashes when accessed later.
-        dvf_array = np.array(itk.array_from_image(dvf_image), copy=True)
-        dvf_image = itk.image_from_array(dvf_array, is_vector=True)
-        dvf_image.SetSpacing(transformix_filter.GetOutputDeformationField().GetSpacing())
-        dvf_image.SetOrigin(transformix_filter.GetOutputDeformationField().GetOrigin())
-        dvf_image.SetDirection(transformix_filter.GetOutputDeformationField().GetDirection())
+        # Materialize a standalone NumPy copy before the producing ITK pipeline goes out of scope.
+        # We only need per-voxel displacement lookups later, and array indexing is safer here
+        # than calling native GetPixel on an image produced by a temporary filter pipeline.
+        dvf_array_zyx = np.array(itk.array_from_image(dvf_image), copy=True)
 
-    return dvf_image
+    return dvf_array_zyx
 
 
 def _safe_itk_cont_index(image: itk.Image, point_physical_xyz: np.ndarray) -> np.ndarray:
@@ -439,7 +435,7 @@ def load_image_context(im_file, is_mri=False):
     }
 
 
-def map_point_with_dvf(point_query_xyz, query_ctx, key_ctx, dvf_image):
+def map_point_with_dvf(point_query_xyz, query_ctx, key_ctx, dvf_array_zyx):
     point_query_xyz = np.asarray(point_query_xyz, dtype=np.int64)
     if not _is_in_bounds(point_query_xyz, query_ctx["itk_shape_xyz"]):
         raise PointMappingError(
@@ -447,10 +443,13 @@ def map_point_with_dvf(point_query_xyz, query_ctx, key_ctx, dvf_image):
         )
 
     query_phys = _index_xyz_to_physical(query_ctx["itk_image"], point_query_xyz)
-    dvf_vector = np.array(
-        dvf_image.GetPixel((int(point_query_xyz[0]), int(point_query_xyz[1]), int(point_query_xyz[2]))),
-        dtype=np.float64,
-    )
+    zyx_index = (int(point_query_xyz[2]), int(point_query_xyz[1]), int(point_query_xyz[0]))
+    try:
+        dvf_vector = np.asarray(dvf_array_zyx[zyx_index], dtype=np.float64)
+    except IndexError as exc:
+        raise PointMappingError(
+            f"DVF array index {list(zyx_index)} out of bounds for shape {tuple(dvf_array_zyx.shape)}."
+        ) from exc
     if dvf_vector.shape != (3,):
         raise PointMappingError(f"Unexpected DVF vector shape at query: {dvf_vector.shape}")
 
