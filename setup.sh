@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 PYTHON_PACKAGES=(
-  numpy
+  "numpy<1.24"
   nibabel
   pillow
   matplotlib
