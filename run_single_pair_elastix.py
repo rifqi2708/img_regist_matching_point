@@ -17,12 +17,12 @@ from PIL import Image, ImageDraw
 # In-code configuration (no CLI)
 # -----------------------------
 SUBJECT_DIR = Path(
-    "/Users/rifqiab2708/Documents/img_regist_matching_point/quadra_cropped_eval/images/quadra_hc_009"
+    "/Users/rifqiab2708/Documents/img_regist_matching_point/quadra_cropped_eval/images/quadra_hc_016"
 )
-FIXED_NAME = "QUADRA_HC_009_Test_CT-AC.nii.gz"
-MOVING_NAME = "QUADRA_HC_009_Retest_CT-AC.nii.gz"
+FIXED_NAME = "QUADRA_HC_016_Test_CT-AC.nii.gz"
+MOVING_NAME = "QUADRA_HC_016_Retest_CT-AC.nii.gz"
 OUTPUT_DIR = Path(
-    "/Users/rifqiab2708/Documents/img_regist_matching_point/outputs/quadra_hc_009"
+    "/Users/rifqiab2708/Documents/img_regist_matching_point/outputs/quadra_hc_016"
 )
 SLICE_INDEX = None  # use center slice when None
 
@@ -63,67 +63,30 @@ def build_parameter_object() -> itk.ParameterObject:
 
     rigid_map = parameter_object.GetDefaultParameterMap("rigid")
     rigid_overrides = {
-        "Transform": "EulerTransform",
-        "Metric": "AdvancedMattesMutualInformation",
-        "Optimizer": "AdaptiveStochasticGradientDescent",
+        "NumberOfResolutions": 4,
+        "MaximumNumberOfIterations": 256,
+        "NumberOfSpatialSamples": 8192,
         "ImageSampler": "RandomCoordinate",
-        "NumberOfResolutions": 3,
-        "ImagePyramidSchedule": [4, 4, 4, 2, 2, 2, 1, 1, 1],
-        "MaximumNumberOfIterations": 500,
-        "NumberOfSpatialSamples": 5000,
-        "AutomaticTransformInitialization": True,
-        "AutomaticScalesEstimation": True,
-        "AutomaticParameterEstimation": True,
-        "UseAdaptiveStepSizes": True,
-        "ASGDParameterEstimationMethod": "OriginalButSigmoidToDefault",
-        "NumberOfHistogramBins": 32,
-        "FixedLimitRangeRatio": 0.0,
-        "MovingLimitRangeRatio": 0.0,
-        "FixedKernelBSplineOrder": 1,
-        "MovingKernelBSplineOrder": 3,
-        "UseFastAndLowMemoryVersion": True,
-        "UseDirectionCosines": True,
-        "ErodeMask": False,
-        "NewSamplesEveryIteration": True,
-        "BSplineInterpolationOrder": 1,
-        "FinalBSplineInterpolationOrder": 3,
-        "HowToCombineTransforms": "Compose",
+        "NewSamplesEveryIteration": "true",
+        "AutomaticTransformInitialization": "true",
+        "AutomaticTransformInitializationMethod": "GeometricalCenter",
+        "WriteResultImage": "false",
+        "ResultImageFormat": "nii.gz",
         "DefaultPixelValue": -1024,
-        "WriteResultImage": False,
     }
     rigid_map = _apply_overrides(rigid_map, rigid_overrides)
 
     bspline_map = parameter_object.GetDefaultParameterMap("bspline")
     bspline_overrides = {
-        "Transform": "BSplineTransform",
-        "Metric": "AdvancedMattesMutualInformation",
-        "Optimizer": "AdaptiveStochasticGradientDescent",
+         "NumberOfResolutions": 4,
+        "MaximumNumberOfIterations": 256,
+        "NumberOfSpatialSamples": 8192,
         "ImageSampler": "RandomCoordinate",
-        "NumberOfResolutions": 3,
-        "ImagePyramidSchedule": [4, 4, 4, 2, 2, 2, 1, 1, 1],
-        "MaximumNumberOfIterations": 500,
-        "NumberOfSpatialSamples": 5000,
-        "FinalGridSpacingInPhysicalUnits": [10.0, 10.0, 10.0],
-        "GridSpacingSchedule": [4.0, 2.0, 1.0],
-        "AutomaticParameterEstimation": True,
-        "UseAdaptiveStepSizes": True,
-        "ASGDParameterEstimationMethod": "OriginalButSigmoidToDefault",
-        "NumberOfHistogramBins": 32,
-        "FixedLimitRangeRatio": 0.0,
-        "MovingLimitRangeRatio": 0.0,
-        "FixedKernelBSplineOrder": 1,
-        "MovingKernelBSplineOrder": 3,
-        "UseFastAndLowMemoryVersion": True,
-        "UseDirectionCosines": True,
-        "ErodeMask": False,
-        "NewSamplesEveryIteration": True,
-        "UseRandomSampleRegion": False,
-        "ExactMetricSampleGridSpacing": 2,
-        "BSplineInterpolationOrder": 1,
-        "FinalBSplineInterpolationOrder": 3,
-        "HowToCombineTransforms": "Compose",
+        "NewSamplesEveryIteration": "true",
+        "FinalGridSpacingInPhysicalUnits": 32.0,
+        "WriteResultImage": "false",
+        "ResultImageFormat": "nii.gz",
         "DefaultPixelValue": -1024,
-        "WriteResultImage": False,
     }
     bspline_map = _apply_overrides(bspline_map, bspline_overrides)
 

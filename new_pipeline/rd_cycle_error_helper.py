@@ -5,6 +5,9 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 
+VOXEL_DECIMALS = 2
+MM_DECIMALS = 1
+
 
 # Convert points from y,x,z array indexing order to x,y,z point-convention order
 def yxz_to_xyz(points):
@@ -139,7 +142,7 @@ def print_result_table(results):
         print(
             f"{idx:03d} | "
             f"{record['pt1'].tolist()} | {record['pt2'].tolist()} | {record['pt1_back'].tolist()} | "
-            f"{record['voxel_error']:.4f} | {record['mm_error']:.4f} | "
+            f"{record['voxel_error']:.{VOXEL_DECIMALS}f} | {record['mm_error']:.{MM_DECIMALS}f} | "
             f"{record['score_12']:.6f} | {record['score_21']:.6f}"
         )
 
@@ -151,15 +154,17 @@ def print_summary(results):
     print("\nCycle error summary")
     print(
         "voxel: "
-        f"count={voxel_stats['count']} mean={voxel_stats['mean']:.4f} median={voxel_stats['median']:.4f} "
-        f"std={voxel_stats['std']:.4f} min={voxel_stats['min']:.4f} max={voxel_stats['max']:.4f} "
-        f"p95={voxel_stats['p95']:.4f}"
+        f"count={voxel_stats['count']} mean={voxel_stats['mean']:.{VOXEL_DECIMALS}f} "
+        f"median={voxel_stats['median']:.{VOXEL_DECIMALS}f} std={voxel_stats['std']:.{VOXEL_DECIMALS}f} "
+        f"min={voxel_stats['min']:.{VOXEL_DECIMALS}f} max={voxel_stats['max']:.{VOXEL_DECIMALS}f} "
+        f"p95={voxel_stats['p95']:.{VOXEL_DECIMALS}f}"
     )
     print(
         "mm:    "
-        f"count={mm_stats['count']} mean={mm_stats['mean']:.4f} median={mm_stats['median']:.4f} "
-        f"std={mm_stats['std']:.4f} min={mm_stats['min']:.4f} max={mm_stats['max']:.4f} "
-        f"p95={mm_stats['p95']:.4f}"
+        f"count={mm_stats['count']} mean={mm_stats['mean']:.{MM_DECIMALS}f} "
+        f"median={mm_stats['median']:.{MM_DECIMALS}f} std={mm_stats['std']:.{MM_DECIMALS}f} "
+        f"min={mm_stats['min']:.{MM_DECIMALS}f} max={mm_stats['max']:.{MM_DECIMALS}f} "
+        f"p95={mm_stats['p95']:.{MM_DECIMALS}f}"
     )
     return voxel_stats, mm_stats
 
@@ -225,10 +230,12 @@ def write_points_csv_with_mask(results, out_path):
         ("pt1_orig" in record) or ("pt2_orig" in record) or ("pt1_back_orig" in record) for record in results
     )
     include_offsets = any(("im1_z_offset" in record) or ("im2_z_offset" in record) for record in results)
+    include_coord_space = any("coord_space" in record for record in results)
 
     fieldnames = [
         "idx",
         "mask_name",
+        "subject_id",
         "pt1_x",
         "pt1_y",
         "pt1_z",
@@ -243,6 +250,8 @@ def write_points_csv_with_mask(results, out_path):
         "score_12",
         "score_21",
     ]
+    if include_coord_space:
+        fieldnames.append("coord_space")
     if include_original_coords:
         fieldnames.extend(
             [
@@ -270,6 +279,7 @@ def write_points_csv_with_mask(results, out_path):
             row = {
                 "idx": idx,
                 "mask_name": str(record.get("mask_name", "")),
+                "subject_id": str(record.get("subject_id", "")),
                 "pt1_x": int(pt1[0]),
                 "pt1_y": int(pt1[1]),
                 "pt1_z": int(pt1[2]),
@@ -284,6 +294,8 @@ def write_points_csv_with_mask(results, out_path):
                 "score_12": float(record["score_12"]),
                 "score_21": float(record["score_21"]),
             }
+            if include_coord_space:
+                row["coord_space"] = str(record.get("coord_space", ""))
             if include_original_coords:
                 pt1_orig = np.asarray(record.get("pt1_orig", [-1, -1, -1]), dtype=int)
                 pt2_orig = np.asarray(record.get("pt2_orig", [-1, -1, -1]), dtype=int)
@@ -486,7 +498,7 @@ def visualize_cycle_result(query_img, target_img, result, out_path=None, show=Tr
 
     fig.suptitle(
         f"score_12={result['score_12']:.6f}, score_21={result['score_21']:.6f}, "
-        f"voxel_err={result['voxel_error']:.4f}, mm_err={result['mm_error']:.4f}",
+        f"voxel_err={result['voxel_error']:.{VOXEL_DECIMALS}f}, mm_err={result['mm_error']:.{MM_DECIMALS}f}",
         fontsize=12,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.97])
@@ -500,3 +512,4 @@ def visualize_cycle_result(query_img, target_img, result, out_path=None, show=Tr
     if show:
         plt.show()
     plt.close(fig)
+    #update

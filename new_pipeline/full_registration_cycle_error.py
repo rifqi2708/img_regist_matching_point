@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import csv
 import gc
 import os
 import sys
@@ -18,6 +19,11 @@ if "MPLCONFIGDIR" not in os.environ:
     os.environ["MPLCONFIGDIR"] = os.path.join(tempfile.gettempdir(), "mplconfig_cycle_error")
 os.environ.setdefault("MPLBACKEND", "Agg")
 os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+os.chdir(PROJECT_ROOT)
 
 try:
     from rd_cycle_error_helper import (
@@ -43,26 +49,55 @@ except ImportError:
         write_points_csv_with_mask,
         write_summary_with_mask_labels_csv,
     )
+try:
+    from coord_space_utils import COORD_SPACE_RAW_ITK
+except ModuleNotFoundError as exc:
+    if getattr(exc, "name", "") != "coord_space_utils":
+        raise
+    from tools.coord_space_utils import COORD_SPACE_RAW_ITK
 
 
+QUERY_POINTS_CSV = "new_pipeline/inc_query_points_raw_itk_latest.csv"
 DATASET_ROOT = "quadra_cropped_eval"
 IMAGES_ROOT = os.path.join(DATASET_ROOT, "images")
 MASKS_ROOT = os.path.join(DATASET_ROOT, "masks")
-OUTPUT_DIR = "outputs/registration_cycle_error"
-
-POINT_MODE = "random"
+OUTPUT_DIR = "outputs/registration_cycle_error_matchSam"
+POINT_MODE = "csv"  # "csv", "random", or "fixed"
 FIXED_POINT = None
 NUM_POINTS_PER_MASK = 100
-SEED = 0
+SEED = 1
 IS_MRI = False
-VISUALIZE = False
+VISUALIZE = True
 VIZ_SHOW = False
 VIZ_SAVE = True
 EXPORT_CSV = True
 VIZ_LAYOUT = (2, 2)
 
-MAX_RANDOM_RETRY_FACTOR = 50
-MIN_RANDOM_RETRY_ATTEMPTS = 100
+REGISTRATION_PARAMETER_OVERRIDES = {
+    "rigid": {
+        "NumberOfResolutions": 4,
+        "MaximumNumberOfIterations": 256,
+        "NumberOfSpatialSamples": 8192,
+        "ImageSampler": "RandomCoordinate",
+        "NewSamplesEveryIteration": "true",
+        "AutomaticTransformInitialization": "true",
+        "AutomaticTransformInitializationMethod": "GeometricalCenter",
+        "WriteResultImage": "false",
+        "ResultImageFormat": "nii.gz",
+        "DefaultPixelValue": -1024,
+    },
+    "bspline": {
+        "NumberOfResolutions": 4,
+        "MaximumNumberOfIterations": 256,
+        "NumberOfSpatialSamples": 8192,
+        "ImageSampler": "RandomCoordinate",
+        "NewSamplesEveryIteration": "true",
+        "FinalGridSpacingInPhysicalUnits": 32.0,
+        "WriteResultImage": "false",
+        "ResultImageFormat": "nii.gz",
+        "DefaultPixelValue": -1024,
+    },
+}
 
 
 class PointMappingError(RuntimeError):
@@ -141,6 +176,103 @@ def list_mask_files(mask_dir):
     return files
 
 
+def _parse_required_int(row: dict[str, str], field_name: str, row_idx: int, csv_path: str) -> int:
+    raw_value = row.get(field_name)
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid '{field_name}' value {raw_value!r} in {csv_path} row {row_idx}.") from exc
+
+
+def load_query_points_by_subject(csv_path: str) -> dict[str, dict[str, list[np.ndarray]]]:
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Query-points CSV not found: {csv_path}")
+
+    query_points_by_subject: dict[str, dict[str, list[np.ndarray]]] = {}
+    with open(csv_path, "r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames or []
+        required_fields = {"subject_id", "mask_name", "pt1_x", "pt1_y", "pt1_z", "coord_space"}
+        missing_fields = sorted(required_fields.difference(fieldnames))
+        if missing_fields:
+            raise ValueError(
+                f"Query-points CSV is missing required columns: {', '.join(missing_fields)}."
+            )
+
+        for row_idx, row in enumerate(reader, start=2):
+            subject_id = str(row.get("subject_id", "")).strip()
+            mask_label = str(row.get("mask_name", "")).strip()
+            coord_space = str(row.get("coord_space", "")).strip()
+            if not subject_id:
+                raise ValueError(f"Missing subject_id in {csv_path} row {row_idx}.")
+            if not mask_label:
+                raise ValueError(f"Missing mask_name in {csv_path} row {row_idx}.")
+            if coord_space != COORD_SPACE_RAW_ITK:
+                raise ValueError(
+                    f"CSV row {row_idx} has coord_space={coord_space!r}. "
+                    f"Expected {COORD_SPACE_RAW_ITK!r}. Use the raw-ITK export from inc_cycle_error.py."
+                )
+
+            subject_prefix = f"{subject_id}/"
+            if not mask_label.startswith(subject_prefix):
+                raise ValueError(
+                    f"CSV row {row_idx} has mask_name '{mask_label}' which does not match subject_id '{subject_id}'."
+                )
+            mask_file_name = mask_label[len(subject_prefix) :]
+            if not mask_file_name:
+                raise ValueError(f"CSV row {row_idx} has an empty mask filename in mask_name '{mask_label}'.")
+
+            point_xyz = np.array(
+                [
+                    _parse_required_int(row, "pt1_x", row_idx, csv_path),
+                    _parse_required_int(row, "pt1_y", row_idx, csv_path),
+                    _parse_required_int(row, "pt1_z", row_idx, csv_path),
+                ],
+                dtype=np.int64,
+            )
+            subject_points = query_points_by_subject.setdefault(subject_id, {})
+            subject_points.setdefault(mask_file_name, []).append(point_xyz)
+
+    if not query_points_by_subject:
+        raise ValueError(f"No query points were loaded from CSV: {csv_path}")
+
+    return query_points_by_subject
+
+
+def _resolve_csv_mask_items(subject_id: str, mask1_dir: str, query_points_by_mask: dict[str, list[np.ndarray]]) -> list[tuple]:
+    if not query_points_by_mask:
+        return []
+
+    mask_map_1 = list_mask_files(mask1_dir)
+    mask_items = []
+    for mask_file_name, points in query_points_by_mask.items():
+        mask1_path = mask_map_1.get(mask_file_name)
+        if mask1_path is None:
+            raise FileNotFoundError(f"CSV mask '{subject_id}/{mask_file_name}' not found under: {mask1_dir}")
+        mask_items.append((mask_file_name, mask1_path, np.asarray(points, dtype=np.int64)))
+    return mask_items
+
+
+def _validate_csv_points_for_mask(subject_id: str, mask_file_name: str, points_xyz, img_ctx, mask1_array) -> np.ndarray:
+    points_xyz = np.asarray(points_xyz, dtype=np.int64)
+    if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
+        raise ValueError(
+            f"CSV query points for {subject_id}/{mask_file_name} must have shape (N, 3), got {points_xyz.shape}."
+        )
+    if len(points_xyz) == 0:
+        raise ValueError(f"No CSV query points were provided for {subject_id}/{mask_file_name}.")
+
+    validated_points = np.asarray(
+        [validate_fixed_point(point, img_ctx["img"]) for point in points_xyz],
+        dtype=np.int64,
+    )
+    try:
+        validate_sampled_points_inside_mask(validated_points, mask1_array, f"{subject_id}:{mask_file_name}")
+    except RuntimeError as exc:
+        raise RuntimeError(f"CSV query points for {subject_id}/{mask_file_name} are invalid: {exc}") from exc
+    return validated_points
+
+
 def _itk_array_yxz(itk_image):
     # ITK array view is z,y,x; helper functions and visualizer use y,x,z.
     array_zyx = np.asarray(itk.array_view_from_image(itk_image))
@@ -179,37 +311,38 @@ def _apply_overrides(parameter_map: dict, overrides: dict[str, str | int | float
     return parameter_map
 
 
+def _format_summary_value(value: str | int | float | bool | list | tuple) -> str:
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(item) for item in value)
+    return str(value)
+
+
+def build_registration_parameter_summary() -> str:
+    lines = ["Registration parameter summary"]
+    for stage_name, overrides in REGISTRATION_PARAMETER_OVERRIDES.items():
+        lines.append(f"- {stage_name}: default '{stage_name}' map with {len(overrides)} overrides")
+        for key in sorted(overrides.keys()):
+            lines.append(f"    {key}: {_format_summary_value(overrides[key])}")
+    return "\n".join(lines)
+
+
+def write_registration_parameter_summary(output_dir: str) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    summary_path = os.path.join(output_dir, "registration_parameters_summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        handle.write(build_registration_parameter_summary())
+        handle.write("\n")
+    return summary_path
+
+
 def build_parameter_object() -> itk.ParameterObject:
     parameter_object = itk.ParameterObject.New()
 
     rigid_map = parameter_object.GetDefaultParameterMap("rigid")
-    rigid_overrides = {
-        "NumberOfResolutions": 4,
-        "MaximumNumberOfIterations": 256,
-        "NumberOfSpatialSamples": 8192,
-        "ImageSampler": "RandomCoordinate",
-        "NewSamplesEveryIteration": "true",
-        "AutomaticTransformInitialization": "true",
-        "AutomaticTransformInitializationMethod": "GeometricalCenter",
-        "WriteResultImage": "false",
-        "ResultImageFormat": "nii.gz",
-        "DefaultPixelValue": -1024,
-    }
-    rigid_map = _apply_overrides(rigid_map, rigid_overrides)
+    rigid_map = _apply_overrides(rigid_map, REGISTRATION_PARAMETER_OVERRIDES["rigid"])
 
     bspline_map = parameter_object.GetDefaultParameterMap("bspline")
-    bspline_overrides = {
-        "NumberOfResolutions": 4,
-        "MaximumNumberOfIterations": 256,
-        "NumberOfSpatialSamples": 8192,
-        "ImageSampler": "RandomCoordinate",
-        "NewSamplesEveryIteration": "true",
-        "FinalGridSpacingInPhysicalUnits": 32.0,
-        "WriteResultImage": "false",
-        "ResultImageFormat": "nii.gz",
-        "DefaultPixelValue": -1024,
-    }
-    bspline_map = _apply_overrides(bspline_map, bspline_overrides)
+    bspline_map = _apply_overrides(bspline_map, REGISTRATION_PARAMETER_OVERRIDES["bspline"])
 
     parameter_object.AddParameterMap(rigid_map)
     parameter_object.AddParameterMap(bspline_map)
@@ -347,10 +480,51 @@ def compute_cycle_for_point(point_1, ctx_12, ctx_21, forward_dvf, backward_dvf):
         "mm_error": mm_error,
     }
 
-
 def _validate_viz_layout(viz_layout):
     if tuple(viz_layout) != (2, 2):
         raise ValueError(f"Only 2x2 layout is supported, got {viz_layout}")
+
+
+def _save_cycle_visualization(
+    subject_id,
+    mask_file_name,
+    mask_results,
+    result,
+    query_img,
+    target_img,
+    visualize,
+    viz_save,
+    viz_show,
+    viz_dir,
+    is_mri,
+    viz_layout,
+):
+    if not visualize:
+        return
+
+    save_path = None
+    if viz_save:
+        pt1 = result["pt1"]
+        pt2 = result["pt2"]
+        pt1_back = result["pt1_back"]
+        safe_mask = strip_nii_suffix(mask_file_name)
+        save_name = (
+            f"{subject_id}_{safe_mask}_cycle_{len(mask_results)-1:03d}_"
+            f"q_{pt1[0]}_{pt1[1]}_{pt1[2]}_"
+            f"m_{pt2[0]}_{pt2[1]}_{pt2[2]}_"
+            f"c_{pt1_back[0]}_{pt1_back[1]}_{pt1_back[2]}.png"
+        )
+        save_path = os.path.join(viz_dir, save_name)
+
+    visualize_cycle_result(
+        query_img=query_img,
+        target_img=target_img,
+        result=result,
+        out_path=save_path,
+        show=viz_show,
+        is_mri=is_mri,
+        viz_layout=viz_layout,
+    )
 
 
 def run_cycle_pair(
@@ -359,6 +533,7 @@ def run_cycle_pair(
     im2_file,
     mask1_dir,
     point_mode=POINT_MODE,
+    query_points_by_mask=None,
     fixed_point=FIXED_POINT,
     num_points_per_mask=NUM_POINTS_PER_MASK,
     seed=SEED,
@@ -369,8 +544,8 @@ def run_cycle_pair(
     viz_dir=OUTPUT_DIR,
     viz_layout=VIZ_LAYOUT,
 ):
-    if point_mode not in ("random", "fixed"):
-        raise ValueError("point_mode must be either 'random' or 'fixed'")
+    if point_mode not in ("csv", "random", "fixed"):
+        raise ValueError("point_mode must be one of 'csv', 'random', or 'fixed'")
     if point_mode == "random" and num_points_per_mask < 1:
         raise ValueError("num_points_per_mask must be >= 1 when point_mode='random'")
     _validate_viz_layout(viz_layout)
@@ -379,13 +554,20 @@ def run_cycle_pair(
         if not os.path.exists(im_path):
             raise FileNotFoundError(f"Image file not found: {im_path}")
 
-    if point_mode == "random":
+    if point_mode == "csv":
+        if query_points_by_mask is None:
+            raise ValueError("query_points_by_mask must be provided when point_mode='csv'")
+        mask_items = _resolve_csv_mask_items(subject_id, mask1_dir, query_points_by_mask)
+    elif point_mode == "random":
         mask_map_1 = list_mask_files(mask1_dir)
         mask_items = sorted(mask_map_1.items())
     else:
         if fixed_point is None:
             raise ValueError("fixed_point must be provided when point_mode='fixed'")
         mask_items = [("fixed_point", None)]
+
+    if point_mode == "csv" and not mask_items:
+        raise RuntimeError(f"No CSV query points were available for subject '{subject_id}'.")
 
     if visualize and viz_save:
         os.makedirs(viz_dir, exist_ok=True)
@@ -407,13 +589,29 @@ def run_cycle_pair(
     all_results = []
     per_mask_results = {}
 
-    for mask_idx, (mask_file_name, mask1_path) in enumerate(mask_items):
+    for mask_idx, mask_item in enumerate(mask_items):
+        if point_mode == "csv":
+            mask_file_name, mask1_path, csv_points = mask_item
+        else:
+            mask_file_name, mask1_path = mask_item
+            csv_points = None
         mask_label = f"{subject_id}/{mask_file_name}"
         print(f"[{subject_id}] Processing mask: {mask_file_name}")
 
         if point_mode == "fixed":
             candidate_points = np.asarray([validate_fixed_point(fixed_point, ctx1["img"])], dtype=np.int64)
             max_attempts = 1
+        elif point_mode == "random":
+            mask1_array = load_mask_array(
+                im1_file,
+                mask1_path,
+                is_mri=is_mri,
+                ref_image=ctx1["img"]["img"],
+                mask_name=f"{subject_id}:{mask_file_name}",
+            )
+            candidate_points = sample_random_mask_points(mask1_array, int(num_points_per_mask), int(seed) + int(mask_idx))
+            validate_sampled_points_inside_mask(candidate_points, mask1_array, f"{subject_id}:{mask_file_name}")
+            max_attempts = len(candidate_points)
         else:
             mask1_array = load_mask_array(
                 im1_file,
@@ -422,90 +620,66 @@ def run_cycle_pair(
                 ref_image=ctx1["img"]["img"],
                 mask_name=f"{subject_id}:{mask_file_name}",
             )
-            max_attempts = max(
-                int(num_points_per_mask) * int(MAX_RANDOM_RETRY_FACTOR),
-                int(MIN_RANDOM_RETRY_ATTEMPTS),
+            candidate_points = _validate_csv_points_for_mask(
+                subject_id=subject_id,
+                mask_file_name=mask_file_name,
+                points_xyz=csv_points,
+                img_ctx=ctx1,
+                mask1_array=mask1_array,
             )
-            candidate_points = None
+            max_attempts = len(candidate_points)
 
+        required_points = 1 if point_mode == "fixed" else (
+            len(candidate_points) if point_mode == "csv" else int(num_points_per_mask)
+        )
         mask_results = []
         attempts = 0
-        batch_id = 0
         last_error = None
 
-        while len(mask_results) < (1 if point_mode == "fixed" else int(num_points_per_mask)):
+        for point in candidate_points:
             if attempts >= max_attempts:
                 break
-
-            if point_mode == "fixed":
-                points_batch = candidate_points
-            else:
-                remaining = int(num_points_per_mask) - len(mask_results)
-                points_batch = sample_random_mask_points(
-                    mask1_array,
-                    num_points=remaining,
-                    seed=int(seed) + int(mask_idx) * 100000 + int(batch_id),
+            attempts += 1
+            try:
+                result = compute_cycle_for_point(
+                    point_1=point,
+                    ctx_12=ctx1,
+                    ctx_21=ctx2,
+                    forward_dvf=forward_dvf,
+                    backward_dvf=backward_dvf,
                 )
-                validate_sampled_points_inside_mask(points_batch, mask1_array, f"{subject_id}:{mask_file_name}")
-                batch_id += 1
+            except PointMappingError as exc:
+                last_error = exc
+                if point_mode in ("csv", "fixed"):
+                    raise RuntimeError(
+                        f"Cycle mapping failed for {mask_label} at query point {np.asarray(point, dtype=int).tolist()}: {exc}"
+                    ) from exc
+                continue
 
-            for point in points_batch:
-                if attempts >= max_attempts:
-                    break
-                attempts += 1
-                try:
-                    result = compute_cycle_for_point(
-                        point_1=point,
-                        ctx_12=ctx1,
-                        ctx_21=ctx2,
-                        forward_dvf=forward_dvf,
-                        backward_dvf=backward_dvf,
-                    )
-                except PointMappingError as exc:
-                    last_error = exc
-                    if point_mode == "fixed":
-                        raise
-                    continue
+            result["mask_name"] = mask_label
+            result["subject_id"] = subject_id
+            result["coord_space"] = COORD_SPACE_RAW_ITK
+            mask_results.append(result)
+            all_results.append(result)
 
-                result["mask_name"] = mask_label
-                result["subject_id"] = subject_id
-                mask_results.append(result)
-                all_results.append(result)
-
-                if visualize:
-                    save_path = None
-                    if viz_save:
-                        pt1 = result["pt1"]
-                        pt2 = result["pt2"]
-                        pt1_back = result["pt1_back"]
-                        safe_mask = strip_nii_suffix(mask_file_name)
-                        save_name = (
-                            f"{subject_id}_{safe_mask}_cycle_{len(mask_results)-1:03d}_"
-                            f"q_{pt1[0]}_{pt1[1]}_{pt1[2]}_"
-                            f"m_{pt2[0]}_{pt2[1]}_{pt2[2]}_"
-                            f"c_{pt1_back[0]}_{pt1_back[1]}_{pt1_back[2]}.png"
-                        )
-                        save_path = os.path.join(viz_dir, save_name)
-
-                    visualize_cycle_result(
-                        query_img=ctx1["img"]["img"],
-                        target_img=ctx2["img"]["img"],
-                        result=result,
-                        out_path=save_path,
-                        show=viz_show,
-                        is_mri=is_mri,
-                        viz_layout=viz_layout,
-                    )
-
-                if point_mode == "fixed":
-                    break
-                if len(mask_results) >= int(num_points_per_mask):
-                    break
+            _save_cycle_visualization(
+                subject_id=subject_id,
+                mask_file_name=mask_file_name,
+                mask_results=mask_results,
+                result=result,
+                query_img=ctx1["img"]["img"],
+                target_img=ctx2["img"]["img"],
+                visualize=visualize,
+                viz_save=viz_save,
+                viz_show=viz_show,
+                viz_dir=viz_dir,
+                is_mri=is_mri,
+                viz_layout=viz_layout,
+            )
 
             if point_mode == "fixed":
                 break
 
-        required_points = 1 if point_mode == "fixed" else int(num_points_per_mask)
         if len(mask_results) < required_points:
             details = (
                 f"Only collected {len(mask_results)}/{required_points} valid mapped points "
@@ -533,6 +707,7 @@ def run_dataset_cycle(
     dataset_root=DATASET_ROOT,
     output_dir=OUTPUT_DIR,
     point_mode=POINT_MODE,
+    query_points_csv=QUERY_POINTS_CSV,
     fixed_point=FIXED_POINT,
     num_points_per_mask=NUM_POINTS_PER_MASK,
     seed=SEED,
@@ -546,11 +721,27 @@ def run_dataset_cycle(
     images_root = os.path.join(dataset_root, "images")
     masks_root = os.path.join(dataset_root, "masks")
 
+    registration_summary_path = write_registration_parameter_summary(output_dir)
+    print(build_registration_parameter_summary())
+    print(f"registration parameters summary saved: {registration_summary_path}")
+
     if export_csv or (visualize and viz_save):
         os.makedirs(output_dir, exist_ok=True)
 
     subject_ids = list_subject_ids(images_root)
-    print(f"Found {len(subject_ids)} subjects under '{images_root}'.")
+    query_points_by_subject = None
+    if point_mode == "csv":
+        query_points_by_subject = load_query_points_by_subject(query_points_csv)
+        total_subjects = len(subject_ids)
+        subject_ids = [subject_id for subject_id in subject_ids if subject_id in query_points_by_subject]
+        print(f"Found {total_subjects} subjects under '{images_root}'.")
+        print(f"Using CSV query points from '{query_points_csv}' for {len(subject_ids)} covered subjects.")
+        if not subject_ids:
+            raise RuntimeError(
+                f"No subjects under '{images_root}' matched the query-points CSV '{query_points_csv}'."
+            )
+    else:
+        print(f"Found {len(subject_ids)} subjects under '{images_root}'.")
 
     all_results = []
     per_mask_aggregate = {}
@@ -567,6 +758,7 @@ def run_dataset_cycle(
                 im2_file=pair["im2_file"],
                 mask1_dir=pair["mask1_dir"],
                 point_mode=point_mode,
+                query_points_by_mask=None if query_points_by_subject is None else query_points_by_subject.get(subject_id),
                 fixed_point=fixed_point,
                 num_points_per_mask=num_points_per_mask,
                 seed=seed,
@@ -628,6 +820,7 @@ if __name__ == "__main__":
             dataset_root=DATASET_ROOT,
             output_dir=OUTPUT_DIR,
             point_mode=POINT_MODE,
+            query_points_csv=QUERY_POINTS_CSV,
             fixed_point=FIXED_POINT,
             num_points_per_mask=NUM_POINTS_PER_MASK,
             seed=SEED,
