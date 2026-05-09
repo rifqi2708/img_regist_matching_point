@@ -58,7 +58,7 @@ except ModuleNotFoundError as exc:
 
 
 QUERY_POINTS_CSV = "new_pipeline/inc_query_points_raw_itk_latest.csv"
-DATASET_ROOT = "quadra_cropped_eval"
+DATASET_ROOT = "data/quadra_dataset_cropped"
 IMAGES_ROOT = os.path.join(DATASET_ROOT, "images")
 MASKS_ROOT = os.path.join(DATASET_ROOT, "masks")
 OUTPUT_DIR = "outputs/registration_cycle_error_matchSam"
