@@ -296,7 +296,9 @@ def load_mask_array(im_file, mask_file, is_mri=False, ref_image=None, mask_name=
     del im_file, is_mri  # kept in signature for interface parity
     validate_mask_file(mask_file, mask_name)
     mask_itk = itk.imread(str(mask_file))
-    mask_array = _itk_array_yxz(mask_itk)
+    # Own the mask data in NumPy before mask_itk goes out of scope; otherwise
+    # the transposed array can reference freed ITK-backed memory and segfault later.
+    mask_array = np.array(_itk_array_yxz(mask_itk), copy=True)
     mask_array = validate_origin_mask(mask_array, mask_array, mask_name)
     if ref_image is not None and tuple(mask_array.shape) != tuple(np.asarray(ref_image).shape):
         raise ValueError(
