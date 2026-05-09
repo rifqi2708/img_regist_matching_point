@@ -377,6 +377,14 @@ def run_registration_and_compute_dvf(fixed_image: itk.Image, moving_image: itk.I
         transformix_filter.SetOutputDirectory(temp_dir)
         transformix_filter.Update()
         dvf_image = transformix_filter.GetOutputDeformationField()
+        # Materialize a standalone copy before the filter/temp directory go out of scope.
+        # Some ITK outputs can retain references to the producing pipeline, which may
+        # otherwise lead to native crashes when accessed later.
+        dvf_array = np.array(itk.array_from_image(dvf_image), copy=True)
+        dvf_image = itk.image_from_array(dvf_array, is_vector=True)
+        dvf_image.SetSpacing(transformix_filter.GetOutputDeformationField().GetSpacing())
+        dvf_image.SetOrigin(transformix_filter.GetOutputDeformationField().GetOrigin())
+        dvf_image.SetDirection(transformix_filter.GetOutputDeformationField().GetDirection())
 
     return dvf_image
 
